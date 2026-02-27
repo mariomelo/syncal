@@ -1,0 +1,160 @@
+name: Elixir CI
+
+on:
+  push:
+    branches: [main, master, deploy]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to production?"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check_deploy.outputs.should_deploy }}
+      app_version: ${{ steps.get_version.outputs.version }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.2"
+          otp-version: "28.0"
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v3
+        with:
+          path: deps
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests
+        run: mix test
+
+      - name: Check for deploy branch
+        id: check_deploy
+        run: |
+          if [[ "${{ github.ref_name }}" == "deploy" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "Detected deploy branch. Will deploy."
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.deploy }}" == "true" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "Manual workflow trigger with deploy option enabled."
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "No deploy trigger detected."
+          fi
+
+      - name: Get current version
+        id: get_version
+        if: steps.check_deploy.outputs.should_deploy == 'true'
+        run: |
+          CURRENT_VERSION=$(grep -oP 'version: "\K[^"]+' mix.exs)
+          echo "Versão atual: $CURRENT_VERSION"
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Build release and deploy
+    needs: test
+    if: needs.test.outputs.should_deploy == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    env:
+      MIX_ENV: prod
+      APP_NAME: syncal
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.2"
+          otp-version: "28.0"
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v3
+        with:
+          path: deps
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: |
+          mix deps.get --only prod
+
+      - name: Build release
+        run: |
+          mix compile
+          MIX_ENV=prod mix assets.deploy
+          MIX_ENV=prod mix phx.gen.release
+          MIX_ENV=prod mix release
+          tar -czf ./syncal-${{ needs.test.outputs.app_version }}.tar.gz _build
+          echo "Release criado e compactado com sucesso."
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Setup known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Upload release to server
+        run: |
+          scp ./syncal-${{ needs.test.outputs.app_version }}.tar.gz ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/apps/downloads/syncal-${{ needs.test.outputs.app_version }}.tar.gz
+
+      - name: Deploy on remote server
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOT'
+            VERSION="${{ needs.test.outputs.app_version }}"
+            APP_DIR=~/apps/syncal/_build
+            DOWNLOAD_DIR=~/apps/downloads
+
+            mkdir -p $APP_DIR
+
+            # Para o serviço
+            sudo systemctl stop syncal.service
+
+            # Extrai a nova versão
+            tar -xzf $DOWNLOAD_DIR/syncal-$VERSION.tar.gz -C $APP_DIR --strip-components=1
+
+            # Roda as migrations
+            $APP_DIR/prod/rel/syncal/bin/migrate
+
+            # Inicia a aplicação
+            sudo systemctl start syncal.service
+
+            rm $DOWNLOAD_DIR/syncal-$VERSION.tar.gz
+
+            echo "Deployment completo para versão $VERSION."
+          EOT
+
+      - name: Deployment notification
+        run: |
+          echo "Deployed version ${{ needs.test.outputs.app_version }} to production server."
