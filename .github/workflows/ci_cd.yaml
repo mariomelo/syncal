@@ -153,13 +153,14 @@ jobs:
 
             mkdir -p $APP_DIR
 
-            # Para o serviço
-            sudo systemctl stop syncal.service
+            # Para o serviço (|| true para primeira vez que ainda não existe)
+            sudo systemctl stop syncal.service || true
 
             # Extrai a nova versão
             tar -xzf $DOWNLOAD_DIR/syncal-$VERSION.tar.gz -C $APP_DIR --strip-components=1
 
-            # Roda as migrations
+            # Carrega variáveis de ambiente e roda as migrations
+            set -a; source ~/apps/syncal/.env; set +a
             $APP_DIR/prod/rel/syncal/bin/migrate
 
             # Inicia a aplicação
